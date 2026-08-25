@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Build and test
+        run: ./mvnw --batch-mode clean verify
+      - name: End-to-end CLI smoke test
+        shell: bash
+        run: |
+          java -jar target/customllm.jar ingest data --embedder hashing
+          java -jar target/customllm.jar info
+          java -jar target/customllm.jar ask "how many days of annual leave" --embedder hashing --no-llm
