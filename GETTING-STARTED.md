@@ -14,20 +14,21 @@ corpus does not contain the answer.
 1. [First, decide what you actually need](#1-first-decide-what-you-actually-need)
 2. [Before you start](#2-before-you-start)
 3. [Create the Java project](#3-create-the-java-project)
-4. [Step 1 of the pipeline: chunking](#4-step-1-of-the-pipeline-chunking)
-5. [Step 2: embeddings](#5-step-2-embeddings)
-6. [Step 3: the vector index and retrieval](#6-step-3-the-vector-index-and-retrieval)
-7. [Step 4: grounded generation](#7-step-4-grounded-generation)
-8. [Step 5: auditing citations](#8-step-5-auditing-citations)
-9. [Wiring the pipeline](#9-wiring-the-pipeline)
-10. [The command line](#10-the-command-line)
-11. [Path 2: building a real custom model definition](#11-path-2-building-a-real-custom-model-definition)
-12. [Path 3: preparing data for fine-tuning](#12-path-3-preparing-data-for-fine-tuning)
-13. [Testing without a GPU](#13-testing-without-a-gpu)
-14. [Making retrieval better](#14-making-retrieval-better)
-15. [Java-specific gotchas](#15-java-specific-gotchas)
-16. [Troubleshooting](#16-troubleshooting)
-17. [Where to go next](#17-where-to-go-next)
+4. [Step 1 of the pipeline: loading your data](#4-step-1-of-the-pipeline-loading-your-data)
+5. [Step 2: chunking](#5-step-2-chunking)
+6. [Step 3: embeddings](#6-step-3-embeddings)
+7. [Step 4: the vector index and retrieval](#7-step-4-the-vector-index-and-retrieval)
+8. [Step 5: grounded generation](#8-step-5-grounded-generation)
+9. [Step 6: auditing citations](#9-step-6-auditing-citations)
+10. [Wiring the pipeline](#10-wiring-the-pipeline)
+11. [The command line](#11-the-command-line)
+12. [Path 2: building a real custom model definition](#12-path-2-building-a-real-custom-model-definition)
+13. [Path 3: preparing data for fine-tuning](#13-path-3-preparing-data-for-fine-tuning)
+14. [Testing without a GPU](#14-testing-without-a-gpu)
+15. [Making retrieval better](#15-making-retrieval-better)
+16. [Java-specific gotchas](#16-java-specific-gotchas)
+17. [Troubleshooting](#17-troubleshooting)
+18. [Where to go next](#18-where-to-go-next)
 
 ---
 
@@ -204,7 +205,362 @@ This is not cosmetic. If `mvnw` gets CRLF endings, Linux CI can fail with `bad i
 
 ---
 
-## 4. Step 1 of the pipeline: chunking
+## 4. Step 1 of the pipeline: loading your data
+
+This is the front door of the whole system, and the part most directly about *your* data. Everything
+downstream depends on it producing two things:
+
+- **text that reads naturally**, because embedding models were trained on prose, not on
+  punctuation-heavy data structures;
+- **a stable name for every document**, because that name ends up in the citation a user sees and
+  needs to be able to look up.
+
+Create **`src/main/java/dev/kuldeepcodes/customllm/loaders/Loaders.java`**. Start with what counts as
+a document:
+
+```java
+/** Plain text document suffixes. */
+public static final Set<String> TEXT_SUFFIXES = Set.of(".txt", ".md", ".markdown");
+/** JSON document suffixes. */
+public static final Set<String> JSON_SUFFIXES = Set.of(".json", ".jsonl", ".ndjson");
+/** Every suffix the loader accepts. */
+public static final Set<String> SUPPORTED_SUFFIXES = Set.of(
+    ".txt", ".md", ".markdown", ".json", ".jsonl", ".ndjson"
+);
+```
+
+### Walking the corpus
+
+```java
+public static List<LoadedDocument> loadDocuments(Path source) throws IOException {
+    if (!Files.exists(source)) {
+        throw new FileNotFoundException("No such path: " + source);
+    }
+
+    List<Path> files;
+    if (Files.isRegularFile(source)) {
+        files = List.of(source);
+    } else {
+        try (Stream<Path> stream = Files.walk(source)) {
+            files = stream.filter(Files::isRegularFile)
+                .filter(path -> SUPPORTED_SUFFIXES.contains(suffix(path)))
+                .sorted()
+                .toList();
+        }
+    }
+
+    List<LoadedDocument> documents = new ArrayList<>();
+    for (Path path : files) {
+        String suffix = suffix(path);
+        if (!SUPPORTED_SUFFIXES.contains(suffix)) {
+            continue;
+        }
+
+        String baseName = Files.isRegularFile(source)
+            ? path.getFileName().toString()
+            : source.relativize(path).toString();
+        baseName = baseName.replace('\\', '/');
+
+        if (JSON_SUFFIXES.contains(suffix)) {
+            documents.addAll(loadJsonDocuments(path, baseName));
+        } else {
+            String text = readUtf8ReplacingMalformedInput(path);
+            if (!text.trim().isEmpty()) {
+                documents.add(new LoadedDocument(baseName, text));
+            }
+        }
+    }
+    return documents;
+}
+```
+
+Four decisions, each with a reason:
+
+**`sorted()`** — ingestion must be reproducible. Filesystem iteration order is not guaranteed, so
+without sorting, two runs over the same folder could produce chunks in different orders, different
+`index` values, and a diff in the index file for no reason.
+
+**`source.relativize(path)` and `.replace('\\', '/')`** — the name goes into every citation. Storing
+an absolute path would leak your home directory into the index and break the moment the folder moves.
+Forcing forward slashes means an index built on Windows is byte-identical to one built on Linux.
+
+**Replacement-character decoding** — one file with a stray byte should not abort ingestion of five
+hundred others. This project uses `new String(Files.readAllBytes(path), StandardCharsets.UTF_8)`,
+whose UTF-8 decoder replaces malformed input rather than throwing.
+
+**Accept a file as well as a directory** — `java -jar target\customllm.jar ingest data\handbook.md`
+is a natural thing to type, and supporting it costs one conditional.
+
+### Why JSON is not just "read the file"
+
+Suppose you export 500 support tickets as a JSON array. Handing the raw file to an embedder is close
+to useless:
+
+- braces, quotes and field names dominate the token stream, crowding out the actual content;
+- every record has identical structure, so records look alike to a vector even when they say
+  completely different things;
+- a citation could only ever point at the whole file — "somewhere in `tickets.json`" is not a useful
+  citation.
+
+What you want is **one document per record**, rendered as readable lines, each individually
+addressable. Two functions do that.
+
+### Splitting a JSON file into records
+
+```java
+public static List<LoadedDocument> loadJsonDocuments(Path path, String baseName) throws IOException {
+    String raw = readUtf8ReplacingMalformedInput(path);
+    if (raw.trim().isEmpty()) {
+        return List.of();
+    }
+
+    if (Set.of(".jsonl", ".ndjson").contains(suffix(path))) {
+        return loadJsonLines(raw, baseName);
+    }
+
+    JsonNode payload;
+    try {
+        payload = JSON.readTree(raw);
+    } catch (JsonProcessingException e) {
+        throw new IllegalArgumentException(jsonError(baseName, e), e);
+    }
+
+    JsonNode records = asRecords(payload);
+    if (records == null) {
+        String text = flattenJson(payload);
+        return text.trim().isEmpty() ? List.of() : List.of(new LoadedDocument(baseName, text));
+    }
+
+    List<LoadedDocument> documents = new ArrayList<>();
+    for (int position = 0; position < records.size(); position++) {
+        String text = flattenJson(records.get(position));
+        if (!text.trim().isEmpty()) {
+            documents.add(new LoadedDocument(baseName + "#" + position, text));
+        }
+    }
+    return documents;
+}
+```
+
+The naming convention is the important part. Record 3 of `support-tickets.json` becomes
+`support-tickets.json#3`, and after chunking its citation reads `support-tickets.json#3:1`. A user
+can open the file, count to the fourth element, and check the claim. That is the whole promise of a
+citation, and it only works if the name is precise.
+
+Note the error message. `JsonProcessingException` on its own tells you *what* is wrong but not *which
+of your 500 files* it happened in — so the file name goes in the message.
+
+### Deciding what the collection is
+
+```java
+private static JsonNode asRecords(JsonNode payload) {
+    if (payload.isArray()) {
+        return payload;
+    }
+    if (payload.isObject()) {
+        List<JsonNode> nonEmptyArrays = new ArrayList<>();
+        payload.fields().forEachRemaining(entry -> {
+            JsonNode value = entry.getValue();
+            if (value.isArray() && !value.isEmpty()) {
+                nonEmptyArrays.add(value);
+            }
+        });
+        if (nonEmptyArrays.size() == 1) {
+            return nonEmptyArrays.get(0);
+        }
+    }
+    return null;
+}
+```
+
+A top-level array is unambiguous: it is the collection.
+
+An object needs judgement. Export formats routinely wrap their payload — `{"items": [...]}`,
+`{"results": [...]}` — and the wrapper carries no information worth indexing. So a single array
+property is unwrapped.
+
+But **two** arrays are left alone deliberately. `{"users": [...], "orders": [...]}` is not a
+collection with a wrapper; it is a document containing two collections, and picking one would silently
+discard the other. When the shape is ambiguous, do the safe thing and index the whole object.
+
+### Turning a record into readable text
+
+```java
+public static String flattenJson(JsonNode value, String prefix, int depth) {
+    if (depth > MAX_JSON_DEPTH) {
+        return prefix.isEmpty() ? "..." : prefix + ": ...";
+    }
+
+    if (value == null || value.isNull()) {
+        return "";
+    }
+
+    if (value.isObject()) {
+        List<String> lines = new ArrayList<>();
+        value.fields().forEachRemaining(entry -> {
+            String key = prefix.isEmpty() ? entry.getKey() : prefix + "." + entry.getKey();
+            String line = flattenJson(entry.getValue(), key, depth + 1);
+            if (!line.isEmpty()) {
+                lines.add(line);
+            }
+        });
+        return String.join("\n", lines);
+    }
+
+    if (value.isArray()) {
+        if (allScalars(value)) {
+            List<String> rendered = new ArrayList<>();
+            for (JsonNode item : value) {
+                if (!item.isNull()) {
+                    rendered.add(scalar(item));
+                }
+            }
+            return rendered.isEmpty() ? "" : prefix + ": " + String.join(", ", rendered);
+        }
+
+        List<String> lines = new ArrayList<>();
+        for (int position = 0; position < value.size(); position++) {
+            String key = prefix.isEmpty() ? "[" + position + "]" : prefix + "[" + position + "]";
+            String line = flattenJson(value.get(position), key, depth + 1);
+            if (!line.isEmpty()) {
+                lines.add(line);
+            }
+        }
+        return String.join("\n", lines);
+    }
+
+    return prefix.isEmpty() ? scalar(value) : prefix + ": " + scalar(value);
+}
+```
+
+Given this ticket:
+
+```json
+{
+  "id": "TKT-1041",
+  "subject": "Grinder jams on the darkest roast",
+  "customer": { "name": "Priya Raman", "plan": "wholesale" },
+  "status": "resolved",
+  "tags": ["hardware", "grinder", "roast-profile"],
+  "body": "Customer reported the EK43 jamming when grinding our darkest roast. ...",
+  "resolution": "Cleaning schedule adjusted. No hardware fault found."
+}
+```
+
+it produces:
+
+```text
+id: TKT-1041
+subject: Grinder jams on the darkest roast
+customer.name: Priya Raman
+customer.plan: wholesale
+status: resolved
+tags: hardware, grinder, roast-profile
+body: Customer reported the EK43 jamming when grinding our darkest roast. ...
+resolution: Cleaning schedule adjusted. No hardware fault found.
+```
+
+Five choices worth understanding:
+
+**Keep the field names.** They are real context. `subject: Grinder jams` embeds better than
+`Grinder jams` alone, because the key tells the model what kind of thing the value is.
+
+**Join nested keys with a dot.** `customer.name` stays traceable back to the original structure, so
+someone reading a citation can find the field in the source file.
+
+**Render scalar lists inline.** `tags: hardware, grinder` reads like prose. One line per tag would
+fragment a single idea across three lines and dilute the embedding.
+
+**Drop nulls entirely.** A line reading `resolution: null` is worse than no line: it is noise that
+embeds, and a model may well read it as a meaningful value.
+
+**Cap the depth.** A deeply nested structure would otherwise produce thousands of lines of key paths
+and nothing else. Six levels is far more than any sensible record needs.
+
+### JSONL, and why line numbers
+
+```java
+private static List<LoadedDocument> loadJsonLines(String raw, String baseName) {
+    List<LoadedDocument> documents = new ArrayList<>();
+    String[] lines = raw.split("\\R", -1);
+    for (int number = 1; number <= lines.length; number++) {
+        String line = lines[number - 1];
+        if (line.trim().isEmpty()) {
+            continue;
+        }
+        JsonNode record;
+        try {
+            record = JSON.readTree(line);
+        } catch (JsonProcessingException e) {
+            throw new IllegalArgumentException(baseName + " line " + number
+                + " is not valid JSON: " + e.getOriginalMessage(), e);
+        }
+        String text = flattenJson(record);
+        if (!text.trim().isEmpty()) {
+            documents.add(new LoadedDocument(baseName + "#" + number, text));
+        }
+    }
+    return documents;
+}
+```
+
+Records are numbered from **1**, not 0, because that number matches what a text editor shows you.
+`events.jsonl#42` should send you to line 42. Array elements start at 0 because that is what indexing
+an array means. The convention matches the format, in both cases.
+
+### Try it
+
+```powershell
+java -jar target\customllm.jar ingest data --embedder ollama
+java -jar target\customllm.jar info
+```
+
+```text
+chunks:     11
+documents:  7
+  handbook.md  (3 chunks)
+  products.md  (3 chunks)
+  support-tickets.json#0  (1 chunks)
+  support-tickets.json#1  (1 chunks)
+  ...
+```
+
+Markdown and JSON in one corpus, each ticket its own document. Now ask something that only the JSON
+can answer:
+
+```powershell
+java -jar target\customllm.jar ask "why did the grinder jam on the dark roast" --embedder ollama
+```
+
+```text
+A: A customer reported their EK43 jamming when grinding the darkest roast, caused by oil build-up on
+   the burrs from a high-oil bean [1].
+
+Sources: support-tickets.json#0:1
+```
+
+The citation points at ticket 0. You can open the file and check it.
+
+### Adding your own format
+
+The pattern generalises. To support PDFs, add `.pdf` to the suffix set and a branch that extracts
+text — everything downstream is unchanged, because it only ever sees `(name, text)` pairs:
+
+```java
+if (".pdf".equals(suffix)) {
+    String text = extractPdfText(path);
+    if (!text.trim().isEmpty()) {
+        documents.add(new LoadedDocument(baseName, text));
+    }
+}
+```
+
+That narrow interface is exactly why the loader is a separate package. CSV rows, database records and
+API responses all fit the same shape: **give every record a stable name and readable text**, and the
+rest of the pipeline does not need to know where it came from.
+
+---
+## 5. Step 2: chunking
 
 Whole documents do not go into prompts. They are too long, and burying one relevant sentence in ten
 pages of text degrades the answer. Documents become retrievable chunks.
@@ -325,7 +681,7 @@ facts.
 
 ---
 
-## 5. Step 2: embeddings
+## 6. Step 3: embeddings
 
 An embedding turns text into a vector. Similar meanings should land near each other, so "holiday
 allowance" can retrieve a sentence that says "annual leave". This project has two embedders behind
@@ -501,7 +857,7 @@ That gap is what embeddings buy you.
 
 ---
 
-## 6. Step 3: the vector index and retrieval
+## 7. Step 4: the vector index and retrieval
 
 A production system may use a vector database. This project uses readable JSON and an exhaustive scan
 on purpose. At a few thousand chunks it is fast enough, and a reader can open the index and inspect
@@ -588,7 +944,7 @@ The tool refuses instead of giving meaningless results.
 
 ---
 
-## 7. Step 4: grounded generation
+## 8. Step 5: grounded generation
 
 Retrieval finds passages. Generation turns them into an answer. Grounding means the model is asked to
 answer only from numbered passages and to cite those numbers.
@@ -668,7 +1024,7 @@ if (raw.isBlank() || raw.toUpperCase().contains("NOT_IN_CONTEXT")) {
 
 ---
 
-## 8. Step 5: auditing citations
+## 9. Step 6: auditing citations
 
 Most RAG tutorials stop after prompting. This project checks the answer afterwards because
 instructions are not guarantees. During development, phi3 cited a passage number it was never given.
@@ -781,11 +1137,12 @@ public static String stripTemplateArtifacts(String text) {
 
 ---
 
-## 9. Wiring the pipeline
+## 10. Wiring the pipeline
 
 The pipeline has four jobs: load documents, chunk them, embed chunks in one batch, and save the index.
 
-Document loading accepts one file or a directory tree:
+Document loading now delegates to `dev.kuldeepcodes.customllm.loaders.Loaders`, so text, Markdown, JSON,
+JSONL and NDJSON all become the same narrow `(name, text)` shape before chunking:
 
 ```java
 if (Files.isRegularFile(source)) {
@@ -800,8 +1157,9 @@ if (Files.isRegularFile(source)) {
 }
 ```
 
-Supported suffixes are `.txt`, `.md`, and `.markdown`. Blank files are skipped. Relative names are
-converted to forward slashes so citations are stable on Windows and Linux.
+Supported suffixes are `.txt`, `.md`, `.markdown`, `.json`, `.jsonl`, and `.ndjson`. Blank files
+and empty JSON records are skipped. Relative names are converted to forward slashes so citations are
+stable on Windows and Linux.
 
 Ingestion batches embeddings:
 
@@ -839,7 +1197,7 @@ Keeping orchestration thin makes each layer independently testable.
 
 ---
 
-## 10. The command line
+## 11. The command line
 
 The CLI has six commands:
 
@@ -892,7 +1250,7 @@ documents contain real Unicode.
 
 ---
 
-## 11. Path 2: building a real custom model definition
+## 12. Path 2: building a real custom model definition
 
 `create-model` genuinely creates a named Ollama model, but it shapes behaviour rather than storing a
 reliable fact database.
@@ -946,7 +1304,7 @@ useful.
 
 ---
 
-## 12. Path 3: preparing data for fine-tuning
+## 13. Path 3: preparing data for fine-tuning
 
 Fine-tuning export writes JSONL records in a standard chat-message shape:
 
@@ -971,7 +1329,7 @@ source text.
 
 ---
 
-## 13. Testing without a GPU
+## 14. Testing without a GPU
 
 The hashing embedder makes the full pipeline deterministic:
 
@@ -1015,11 +1373,11 @@ Run:
 .\mvnw.cmd clean verify
 ```
 
-The project currently has 74 deterministic tests.
+The project currently has 103 deterministic tests.
 
 ---
 
-## 14. Making retrieval better
+## 15. Making retrieval better
 
 Work in this order when answers disappoint:
 
@@ -1036,7 +1394,7 @@ Work in this order when answers disappoint:
 
 ---
 
-## 15. Java-specific gotchas
+## 16. Java-specific gotchas
 
 **Maven Wrapper properties.** After generating the wrapper, inspect `.mvn/wrapper/maven-wrapper.properties`.
 PowerShell can mis-parse the Maven version property. The `distributionUrl` must point to Maven 3.9.16.
@@ -1053,12 +1411,18 @@ This implementation uses SHA-256 and documents how bucket and sign are chosen.
 **UTF-8 output.** Wrap stdout and stderr in UTF-8 `PrintStream`s. Windows console defaults are not a
 safe assumption for document text.
 
+**Jackson JSON nodes.** Use `JsonNode.numberValue().toString()` for flattened numbers rather than
+converting everything through doubles, or integer-looking IDs and counts can pick up `.0` artefacts.
+`JsonNode.asText()` is fine for strings, but booleans are rendered explicitly as lower-case `true` and
+`false`. Jackson preserves object field order while parsing, and the loader relies on that to keep
+flattened records readable and predictable.
+
 **Readable JSON.** Jackson's default pretty printer keeps primitive arrays on one line. This project
 serializes vectors as lists and configures an array indenter so the index remains readable.
 
 ---
 
-## 16. Troubleshooting
+## 17. Troubleshooting
 
 **`Model 'phi3' cannot produce embeddings` or HTTP 501.**
 You used a generation model as an embedder. Run `ollama pull all-minilm` and use `--embed-model all-minilm`.
@@ -1096,7 +1460,7 @@ The shell script has CRLF endings. Keep `.gitattributes` and re-check out the fi
 
 ---
 
-## 17. Where to go next
+## 18. Where to go next
 
 - Point the tool at your own documents: `java -jar target/customllm.jar ingest C:\notes`.
 - Add document converters for PDF or Word before `loadDocuments`.

@@ -212,8 +212,39 @@ java -jar target\customllm.jar ingest C:\path\to\notes --embedder ollama
 java -jar target\customllm.jar ask "what did we decide about pricing" --embedder ollama --show-context
 ```
 
-Supported formats are `.txt`, `.md`, and `.markdown`. Convert PDFs or Word files first. That keeps the
-core project honest and dependency-light.
+### Supported formats
+
+| Extension | How it is read |
+| --- | --- |
+| `.md`, `.markdown`, `.txt` | One document per file |
+| `.json` | A top-level array becomes **one document per element**, named `file.json#0`, `file.json#1`, ... A single wrapped array (`{"items": [...]}`) is unwrapped. Anything else is one document |
+| `.jsonl`, `.ndjson` | One document per line, named `file.jsonl#1`, `#2`, ... numbered as your editor shows them |
+
+JSON records are flattened into readable `key: value` lines rather than fed in raw, because embedding
+models were trained on prose and braces carry no meaning:
+
+```json
+{"id": "TKT-1041", "customer": {"name": "Priya"}, "tags": ["hardware", "grinder"]}
+```
+
+becomes
+
+```text
+id: TKT-1041
+customer.name: Priya
+tags: hardware, grinder
+```
+
+Field names are kept because they are genuine context — `subject: Grinder jams` embeds better than
+the bare value. Nulls are dropped, since a line reading `resolution: null` is noise that embeds.
+
+Splitting an array into one document per element is the point of JSON support: a citation reading
+`support-tickets.json#3:1` sends you to a specific record you can open and check, whereas "somewhere
+in tickets.json" tells you nothing.
+
+For PDFs or Word files, convert them first (`pandoc`, `pdftotext`) — deliberately not built in, so
+the dependency list stays honest. [GETTING-STARTED.md](GETTING-STARTED.md#4-step-1-of-the-pipeline-loading-your-data)
+shows how to add a format in about five lines.
 
 Tuning tips:
 
@@ -231,11 +262,12 @@ Tuning tips:
 .\mvnw.cmd clean verify
 ```
 
-The suite has 74 deterministic tests. It covers chunking edge cases, hashing determinism across
+The suite has 103 deterministic tests. It covers chunking edge cases, hashing determinism across
 instances, unit-length vectors, cosine identities and mismatch errors, index round-trip through disk,
 embedder compatibility refusal, hybrid ranking, relevance-floor refusal, `NOT_IN_CONTEXT`, invalid
 citations, weak citations using the observed Meridian case, template artifact stripping, Modelfile
-contents, JSONL export validity, and end-to-end ingest/ask with a stub chat client.
+contents, JSONL export validity, and end-to-end ingest/ask with a stub chat client, plus JSON
+loading, flattening, JSONL line numbering, and mixed corpora.
 
 Tests use hashing embeddings and stubs, so they need no network, no model, and no GPU.
 

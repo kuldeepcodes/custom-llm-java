@@ -1,0 +1,47 @@
+[
+  {
+    "id": "TKT-1041",
+    "subject": "Grinder jams on the darkest roast",
+    "customer": { "name": "Priya Raman", "plan": "wholesale" },
+    "status": "resolved",
+    "tags": ["hardware", "grinder", "roast-profile"],
+    "body": "Customer reported the EK43 jamming when grinding our darkest roast. Cause was oil build-up on the burrs from a high-oil bean. Advised cleaning with grinder tablets every 20 kilograms rather than the standard 40 for oily roasts.",
+    "resolution": "Cleaning schedule adjusted. No hardware fault found."
+  },
+  {
+    "id": "TKT-1078",
+    "subject": "Wholesale bag arrived without a degassing valve",
+    "customer": { "name": "Tom Okonkwo", "plan": "wholesale" },
+    "status": "resolved",
+    "tags": ["packaging", "quality"],
+    "body": "A 1 kilogram wholesale bag was delivered with no one-way valve fitted. Without the valve, carbon dioxide from fresh roast has nowhere to escape and the bag can split.",
+    "resolution": "Replacement shipped same day. Batch checked; a single sealing head was misaligned and has been recalibrated."
+  },
+  {
+    "id": "TKT-1093",
+    "subject": "Cold brew tastes flat compared to last order",
+    "customer": { "name": "Sara Lindqvist", "plan": "retail" },
+    "status": "resolved",
+    "tags": ["brewing", "cold-brew"],
+    "body": "Customer steeped cold brew for 8 hours instead of the recommended 16, using a medium grind rather than coarse. Under-extraction produced a thin, flat cup.",
+    "resolution": "Advised a 1:8 ratio, coarse grind and a full 16 hour steep at room temperature. Customer confirmed the next batch was correct."
+  },
+  {
+    "id": "TKT-1112",
+    "subject": "Is the decaf processed with chemicals?",
+    "customer": { "name": "Marcus Bell", "plan": "retail" },
+    "status": "resolved",
+    "tags": ["decaf", "process"],
+    "body": "Customer asked whether our decaf uses solvent-based decaffeination. It does not. We use the Swiss Water method, which uses only water and carbon filtration, and removes 99.9 percent of caffeine.",
+    "resolution": "Explained the Swiss Water process. Customer satisfied."
+  },
+  {
+    "id": "TKT-1130",
+    "subject": "Refund requested for an opened bag",
+    "customer": { "name": "Elena Duarte", "plan": "retail" },
+    "status": "closed",
+    "tags": ["returns", "policy"],
+    "body": "Customer opened a bag of Halcyon and disliked the pronounced grapefruit acidity. Halcyon is a deliberately bright coffee and this is expected of the profile.",
+    "resolution": "Store credit issued as a goodwill gesture. Customer redirected to Meridian, which suits a general palate better."
+  }
+]

@@ -9,26 +9,23 @@ import dev.kuldeepcodes.customllm.generate.ChatClient;
 import dev.kuldeepcodes.customllm.generate.Grounding;
 import dev.kuldeepcodes.customllm.index.SearchResult;
 import dev.kuldeepcodes.customllm.index.VectorIndex;
+import dev.kuldeepcodes.customllm.loaders.Loaders;
 import java.io.BufferedWriter;
-import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Stream;
 
 /** End-to-end RAG pipeline and custom-model/fine-tuning helpers. */
 public final class Pipeline {
     /** Supported document extensions. */
-    public static final Set<String> SUPPORTED_SUFFIXES = Set.of(".txt", ".md", ".markdown");
+    public static final Set<String> SUPPORTED_SUFFIXES = Loaders.SUPPORTED_SUFFIXES;
     /** Default index path. */
     public static final Path DEFAULT_INDEX_PATH = Path.of(".customllm", "index.json");
 
@@ -45,35 +42,9 @@ public final class Pipeline {
      * @throws IOException when reading fails
      */
     public static List<Document> loadDocuments(Path source) throws IOException {
-        if (!Files.exists(source)) {
-            throw new FileNotFoundException("No such path: " + source);
-        }
-        List<Path> files;
-        if (Files.isRegularFile(source)) {
-            files = List.of(source);
-        } else {
-            try (Stream<Path> stream = Files.walk(source)) {
-                files = stream.filter(Files::isRegularFile)
-                    .filter(path -> SUPPORTED_SUFFIXES.contains(suffix(path)))
-                    .sorted()
-                    .toList();
-            }
-        }
-        List<Document> documents = new ArrayList<>();
-        for (Path path : files) {
-            if (!SUPPORTED_SUFFIXES.contains(suffix(path))) {
-                continue;
-            }
-            String text = Files.readString(path, StandardCharsets.UTF_8);
-            if (!text.trim().isEmpty()) {
-                String name = Files.isRegularFile(source)
-                    ? path.getFileName().toString()
-                    : source.relativize(path).toString();
-                documents.add(new Document(name.replace('\\', '/'), text));
-            }
-        }
-        documents.sort(Comparator.comparing(Document::name));
-        return documents;
+        return Loaders.loadDocuments(source).stream()
+            .map(document -> new Document(document.name(), document.text()))
+            .toList();
     }
 
     /**
@@ -97,7 +68,7 @@ public final class Pipeline {
         List<Document> documents = loadDocuments(source);
         if (documents.isEmpty()) {
             throw new IllegalArgumentException("No readable documents in " + source
-                + ". Supported extensions: .markdown, .md, .txt");
+                + ". Supported extensions: .json, .jsonl, .markdown, .md, .ndjson, .txt");
         }
         List<Chunk> chunks = new ArrayList<>();
         List<String> skipped = new ArrayList<>();
@@ -280,12 +251,6 @@ public final class Pipeline {
             }
         }
         return written;
-    }
-
-    private static String suffix(Path path) {
-        String name = path.getFileName().toString().toLowerCase(Locale.ROOT);
-        int dot = name.lastIndexOf('.');
-        return dot < 0 ? "" : name.substring(dot);
     }
 
     /**
