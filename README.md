@@ -47,6 +47,33 @@ If your goal is "answer questions about my documents", you want option 1. Fine-t
 and behaviour; it does not give you a reliable, citable fact table. Facts change, and re-indexing is
 simpler and safer than retraining.
 
+```mermaid
+flowchart LR
+    DATA[("Your data")]
+
+    DATA --> P1["<b>1 &middot; RAG</b><br/>index it, retrieve at<br/>question time"]
+    DATA --> P2["<b>2 &middot; Custom model</b><br/>ollama create<br/>with a system prompt"]
+    DATA --> P3["<b>3 &middot; Fine-tune</b><br/>JSONL &rarr; LoRA"]
+
+    P1 --> R1["cites its sources<br/>refuses when unsure<br/>update = re-index<br/><br/><b>minutes, CPU</b>"]
+    P2 --> R2["shapes tone and format<br/><b>invents facts</b><br/>cannot cite<br/><br/><b>seconds</b>"]
+    P3 --> R3["changes deep behaviour<br/>still cannot cite<br/>retrain to update<br/><br/><b>hours, GPU</b>"]
+
+    R1 --> USE1["Use for<br/><b>facts about your documents</b>"]
+    R2 --> USE2["Use for<br/><b>persona and format</b>"]
+    R3 --> USE3["Use for<br/><b>behaviour prompting cannot reach</b>"]
+
+    classDef store fill:#0d3b66,stroke:#0d3b66,color:#fff
+    classDef good fill:#1b5e20,stroke:#1b5e20,color:#fff
+    classDef mid fill:#7c4a03,stroke:#7c4a03,color:#fff
+
+    class DATA store
+    class R1,USE1 good
+    class R2,R3 mid
+```
+
+This repository does all three, and is honest about what each delivers.
+
 ### The demonstration that settles it
 
 During development, `create-model` built a real Ollama model whose system prompt described this
@@ -148,60 +175,144 @@ the same query with `--embedder hashing` to see the difference.
 
 ## How it works
 
-```text
-documents ─► chunk ─► embed ─► index
-                                 │
-question ─► embed ─────────────► search ─► passages ─► prompt ─► LLM ─► answer + citations
-                                              │                            │
-                                    below relevance floor?          citations audited
-                                              └──► refuse                  │
-                                                                  invalid / weak → warn
+```mermaid
+flowchart TD
+    subgraph INGEST["INGEST &mdash; once per corpus change"]
+        direction LR
+        SRC["Your files<br/><code>.md .txt .json .jsonl</code>"]
+        LOAD["<b>load</b><br/>walk, name<br/>flatten JSON to<br/>one doc per record"]
+        CHUNK["<b>chunk</b><br/>whole sentences + overlap<br/>keeps source:line"]
+        EMB1["<b>embed</b><br/>one batched call"]
+        SRC --> LOAD --> CHUNK --> EMB1
+    end
+
+    IDX[("<b>index.json</b> &mdash; vectors + provenance + embedder name")]
+    EMB1 --> IDX
+
+    subgraph QUERY["QUERY &mdash; per question"]
+        direction LR
+        Q["Question"]
+        EMB2["<b>embed</b> question<br/>same model as index"]
+        SEARCH["<b>search</b><br/>0.75 cosine + 0.25 keyword"]
+        Q --> EMB2 --> SEARCH
+    end
+
+    IDX --> QUERY
+    SEARCH --> FLOOR{"top score at least 0.25?"}
+
+    FLOOR -->|no| REFUSE["<b>refuse</b><br/>nothing in the indexed<br/>documents answers that"]
+    FLOOR -->|yes| PROMPT["<b>prompt</b> &mdash; numbered passages,<br/>cite every claim, NOT_IN_CONTEXT escape"]
+
+    PROMPT --> LLM["LLM"] --> AUDIT["<b>audit citations</b>"]
+    AUDIT --> ANSWER["<b>Answer</b> + handbook.md:19"]
+    AUDIT -.->|number never supplied| W1["warn: fabricated"]
+    AUDIT -.->|wording mismatch| W2["warn: mis-numbered"]
+
+    classDef store fill:#0d3b66,stroke:#0d3b66,color:#fff
+    classDef good fill:#1b5e20,stroke:#1b5e20,color:#fff
+    classDef stop fill:#7f1d1d,stroke:#7f1d1d,color:#fff
+    classDef warn fill:#7c4a03,stroke:#7c4a03,color:#fff
+
+    class IDX store
+    class ANSWER good
+    class REFUSE stop
+    class W1,W2 warn
 ```
 
-### Sentence-aware chunking with overlap
+The two phases are deliberately separate. **Ingest** is the slow part and runs only when your
+documents change. **Query** is fast, and touches nothing but the index — which is why updating what
+the system knows is a re-index measured in seconds, not a retrain measured in hours.
 
-Chunks are packed from whole sentences up to a soft character budget. The next chunk repeats trailing
-sentences from the previous one. Overlap matters because a fact on a boundary can otherwise be split
-across two chunks and retrievable in neither. Each `Chunk` carries `text`, `source`, `index`, and
-`startLine`, so answers can cite `handbook.md:19` rather than hand-wave at a corpus.
+### What happens when you ask a question
 
-### Embeddings
+Every component, in the order it is actually called:
 
-`HashingEmbedder` is deterministic and dependency-free. It tokenizes `[a-z0-9]+`, drops stop words,
-hashes each token with SHA-256, chooses a bucket and sign, accumulates, and L2-normalizes. It is not
-semantic, but it makes tests and CI reliable.
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as You
+    participant CLI as CLI<br/>(java -jar target/customllm.jar ask)
+    participant PIPE as Pipeline
+    participant EMB as Embedder<br/>(all-minilm)
+    participant IDX as VectorIndex<br/>(index.json)
+    participant GEN as Grounding
+    participant LLM as OllamaChat<br/>(phi3)
 
-`OllamaEmbedder` calls `/api/embed` with `all-minilm` by default. It normalizes returned vectors and
-turns HTTP 501 into a helpful explanation that generation models such as `phi3` are not embedding
-models.
+    U->>CLI: ask "how much annual leave?"
+    CLI->>IDX: VectorIndex.load(indexPath)
+    IDX-->>CLI: chunks + vectors + embedder name
 
-### Hybrid retrieval
+    CLI->>PIPE: Pipeline.ask(question, index, embedder, chat, topK=4)
+    PIPE->>IDX: ensureCompatible(embedder)
+    Note over PIPE,IDX: Refuses if the index was built with a<br/>different model. Cross-model cosine is<br/>arithmetic without meaning.
+    IDX-->>PIPE: ok
 
-The score is 75% cosine similarity and 25% keyword overlap. Pure vector search can smooth away rare
-literal tokens such as part numbers, error codes, or surnames. Pure keyword search misses paraphrase.
-Together they cover each other's blind spots.
+    PIPE->>EMB: embedOne(question)
+    EMB-->>PIPE: unit vector
 
-### Relevance floor
+    PIPE->>IDX: search(question, vector, topK=4)
+    Note over IDX: 0.75 x cosine + 0.25 x keyword overlap
+    IDX-->>PIPE: ranked passages with source:line
 
-If the top score is below 0.25, the tool refuses before calling the LLM. Passing irrelevant context to
-a model is an invitation to improvise.
+    PIPE->>GEN: answerQuestion(question, passages, chat)
 
-### Citation auditing
+    alt top score below 0.25
+        GEN-->>PIPE: refusal, grounded = false
+        Note over GEN: The corpus has no answer.<br/>Never ask the model to improvise.
+    else passages look relevant
+        GEN->>GEN: buildPrompt(question, passages)
+        Note over GEN: [1] (handbook.md:19) Everyone receives 27 days...<br/>[2] (products.md:1) Meridian is 60 percent...
+        GEN->>LLM: SYSTEM_PROMPT + numbered passages
+        LLM-->>GEN: "Employees get 27 days [1]."
+        GEN->>GEN: stripTemplateArtifacts
+        GEN->>GEN: check cited numbers exist
+        GEN->>GEN: check wording matches cited passage
+        GEN-->>PIPE: answer + citations + any warnings
+    end
 
-The prompt tells the model to cite numbered passages, but prompts are not guarantees. The answer is
-checked afterwards:
+    PIPE-->>CLI: Answer
+    CLI-->>U: A: Employees get 27 days [1].<br/>Sources: handbook.md:19
+```
 
-- **Invalid citations** cite passage numbers that were never supplied.
-- **Weak citations** point at passages sharing little wording with the answer when another passage
-  matches much better.
+Three things in that sequence are easy to miss and matter a lot:
 
-This catches the real small-model failure where an answer is right but the citation number is wrong.
+**The compatibility check happens before any work** (step 5). Querying an index with a different
+embedder than built it produces no error — just silently meaningless scores. Failing loudly here
+saves an afternoon of misdiagnosis.
 
-### Embedder identity in the index
+**The model is never asked to improvise** (step 12). If the best passage is too weak, the LLM is
+not called at all. You cannot hallucinate from a prompt you never sent.
 
-The JSON index records `embedder` and `dimensions`. Querying an index built with another model is
-refused because cosine similarity across different embedding spaces is arithmetic without meaning.
-The failure is otherwise silent: plausible-looking scores and terrible retrieval.
+**The model's output is checked, not trusted** (steps 16–18). The prompt asks for honest citations;
+the audit verifies them. Instructions are not guarantees.
+
+Six decisions worth knowing about:
+
+**One document per JSON record.** A top-level array becomes `file.json#0`, `#1`, … rather than one
+blob, so a citation points at a record you can actually open and check.
+
+**Sentence-aware chunking with overlap.** Chunks are packed with whole sentences up to a size
+budget, and each chunk repeats a little of the previous one. Overlap matters because a fact
+sitting on a boundary would otherwise be split across two chunks and retrievable in neither.
+
+**Hybrid retrieval.** Score is 75% cosine similarity, 25% keyword overlap. Pure vector search is
+weak on rare literal tokens — part numbers, error codes, surnames — because embeddings smooth
+them away. Pure keyword search misses paraphrase. Together they cover each other.
+
+**A relevance floor.** If the best passage scores below 0.25, the system refuses rather than
+letting the model improvise from thin context.
+
+**Citation auditing.** Instructions are not guarantees, so citations are checked afterwards:
+- *invalid* — the answer cited a passage number that was never supplied
+- *weak* — the cited passage shares little wording with the claim, so the number is probably
+  wrong even where the content is right
+
+That second check exists because phi3 answered a question correctly from passage [1] and then
+cited [2]. A citation nobody verifies is decoration.
+
+**Embedder identity is recorded in the index.** Querying an index built by a different model is
+refused outright. Cosine similarity between vectors from two different models is arithmetic
+without meaning, and the symptom is not an error — it is quietly terrible retrieval.
 
 ---
 
